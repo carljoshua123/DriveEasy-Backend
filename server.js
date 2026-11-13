@@ -107,7 +107,7 @@ app.use("/api/admin", adminRoutes);
 // Routes
 // -------------------
 app.use("/api/auth", require("./routes/auth"));
-app.use("/api/cars", require("./routes/cars"));
+app.use("/api/cars", require("./routes/Cars"));
 app.use("/api/bookings", require("./routes/bookings"));
 app.use("/api/users", require("./routes/users"));
 app.use("/api/messages", require("./routes/messages"));
