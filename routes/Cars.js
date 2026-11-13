@@ -3,6 +3,8 @@ const router = express.Router();
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const { Readable } = require("stream");
+const cloudinary = require("cloudinary").v2;
 const Car = require("../models/Car");
 const authenticate = require("../middleware/auth");
 
@@ -18,7 +20,6 @@ const canManageCar = (car, user) =>
   (user?.role === "admin" && car.ownerId?.toString() === user.id);
 
 const uploadDirectory = path.join(__dirname, "..", "uploads");
-fs.mkdirSync(uploadDirectory, { recursive: true });
 
 const imageExtensions = {
   "image/jpeg": ".jpg",
@@ -28,12 +29,7 @@ const imageExtensions = {
 };
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: uploadDirectory,
-    filename: (req, file, callback) => {
-      callback(null, `${require("crypto").randomUUID()}${imageExtensions[file.mimetype]}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 10 },
   fileFilter: (req, file, callback) => {
     if (!imageExtensions[file.mimetype]) {
@@ -52,24 +48,19 @@ const handleImageUpload = (req, res, next) => {
     { name: "image", maxCount: 1 },
   ])(req, res, (error) => {
     if (!error) return next();
-    const partialUploads = Object.values(req.files || {}).flat();
-    Promise.all(partialUploads.map((file) => removeUploadedImage(`/uploads/${file.filename}`)))
-      .then(() => {
-        if (error.code === "LIMIT_FILE_SIZE") {
-          return res.status(413).json({ message: "Each image must be 5 MB or smaller." });
-        }
-        if (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE") {
-          return res.status(400).json({ message: "Upload up to 10 images per car." });
-        }
-        if (error.code === "INVALID_IMAGE_TYPE") {
-          return res.status(400).json({ message: error.message });
-        }
-        if (error instanceof multer.MulterError) {
-          return res.status(400).json({ message: error.message });
-        }
-        return next(error);
-      })
-      .catch(next);
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ message: "Each image must be 5 MB or smaller." });
+    }
+    if (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({ message: "Upload up to 10 images per car." });
+    }
+    if (error.code === "INVALID_IMAGE_TYPE") {
+      return res.status(400).json({ message: error.message });
+    }
+    if (error instanceof multer.MulterError) {
+      return res.status(400).json({ message: error.message });
+    }
+    return next(error);
   });
 };
 
@@ -77,6 +68,69 @@ const getUploadedImages = (req) => [
   ...(req.files?.images || []),
   ...(req.files?.image || []),
 ];
+
+const configureCloudinary = () => {
+  const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+    throw new Error("Cloudinary is not configured. Set its credentials in the backend environment.");
+  }
+
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET,
+    secure: true,
+  });
+};
+
+const uploadImageToCloudinary = (file) => new Promise((resolve, reject) => {
+  const stream = cloudinary.uploader.upload_stream(
+    {
+      folder: "driveeasy/cars",
+      resource_type: "image",
+    },
+    (error, result) => {
+      if (error) return reject(error);
+      if (!result?.secure_url || !result.public_id) {
+        return reject(new Error("Cloudinary returned an incomplete image upload result."));
+      }
+      resolve({ url: result.secure_url, publicId: result.public_id });
+    }
+  );
+  Readable.from([file.buffer]).pipe(stream);
+});
+
+const uploadImagesToCloudinary = async (files) => {
+  if (!files.length) return [];
+  configureCloudinary();
+
+  const results = await Promise.allSettled(files.map(uploadImageToCloudinary));
+  const uploadedAssets = results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value);
+  const failedUpload = results.find((result) => result.status === "rejected");
+  if (failedUpload) {
+    await removeCloudinaryImages(uploadedAssets.map((asset) => asset.publicId));
+    throw failedUpload.reason;
+  }
+
+  return uploadedAssets;
+};
+
+const removeCloudinaryImages = async (publicIds) => {
+  if (!publicIds.length) return;
+  try {
+    configureCloudinary();
+    const results = await Promise.allSettled(
+      publicIds.map((publicId) => cloudinary.uploader.destroy(publicId, { resource_type: "image" }))
+    );
+    results
+      .filter((result) => result.status === "rejected")
+      .forEach((result) => console.error("Could not remove Cloudinary car image:", result.reason));
+  } catch (error) {
+    console.error("Could not remove Cloudinary car images:", error.message);
+  }
+};
 
 const removeUploadedImage = async (image) => {
   if (typeof image !== "string" || !image.startsWith("/uploads/")) return;
@@ -95,55 +149,60 @@ const removeUploadedImage = async (image) => {
 
 const removeCarImages = async (car) => {
   const images = [...(car.images || []), car.image].filter(Boolean);
-  await Promise.all([...new Set(images)].map(removeUploadedImage));
+  await Promise.all([
+    ...[...new Set(images)].map(removeUploadedImage),
+    removeCloudinaryImages(car.imagePublicIds || []),
+  ]);
 };
 
 // Add a car
 router.post("/add", authenticate, requireAdmin, handleImageUpload, async (req, res) => {
   const uploadedImages = getUploadedImages(req);
-  const imagePaths = uploadedImages.map((file) => `/uploads/${file.filename}`);
+  let uploadedAssets = [];
   try {
+    uploadedAssets = await uploadImagesToCloudinary(uploadedImages);
+    const imageUrls = uploadedAssets.map((asset) => asset.url);
     const car = new Car({
       ...req.body,
-      image: imagePaths[0] || req.body.image,
-      images: imagePaths.length ? imagePaths : req.body.image ? [req.body.image] : [],
+      image: imageUrls[0] || req.body.image,
+      images: imageUrls.length ? imageUrls : req.body.image ? [req.body.image] : [],
+      imagePublicIds: uploadedAssets.map((asset) => asset.publicId),
       ownerId: req.user.id,
     });
     await car.save();
     res.status(201).json({ message: "Car added", car });
   } catch (err) {
-    console.error(err);
-    await Promise.all(uploadedImages.map((file) => removeUploadedImage(`/uploads/${file.filename}`)));
-    res.status(500).json({ message: "Server error" });
+    console.error("Could not add car or upload its images:", err.message);
+    await removeCloudinaryImages(uploadedAssets.map((asset) => asset.publicId));
+    res.status(500).json({ message: err.message || "Could not add car." });
   }
 });
 
 // Update car
 router.put("/update/:id", authenticate, requireAdmin, handleImageUpload, async (req, res) => {
   const uploadedImages = getUploadedImages(req);
+  let uploadedAssets = [];
   try {
     const car = await Car.findById(req.params.id);
-    if (!car) {
-      await Promise.all(uploadedImages.map((file) => removeUploadedImage(`/uploads/${file.filename}`)));
-      return res.status(404).json({ message: "Car not found" });
-    }
+    if (!car) return res.status(404).json({ message: "Car not found" });
     if (!canManageCar(car, req.user)) {
-      await Promise.all(uploadedImages.map((file) => removeUploadedImage(`/uploads/${file.filename}`)));
       return res.status(403).json({ message: "You can only update cars you uploaded." });
     }
 
+    uploadedAssets = await uploadImagesToCloudinary(uploadedImages);
     ["name", "seats", "transmission", "fuel", "price", "description"].forEach((field) => {
       if (req.body[field] !== undefined) car[field] = req.body[field];
     });
     const currentImages = car.images?.length ? car.images : car.image ? [car.image] : [];
-    car.images = [...currentImages, ...uploadedImages.map((file) => `/uploads/${file.filename}`)];
+    car.images = [...currentImages, ...uploadedAssets.map((asset) => asset.url)];
+    car.imagePublicIds = [...(car.imagePublicIds || []), ...uploadedAssets.map((asset) => asset.publicId)];
     car.image = car.images[0] || car.image;
     const updated = await car.save();
     res.json(updated);
   } catch (err) {
-    console.error(err);
-    await Promise.all(uploadedImages.map((file) => removeUploadedImage(`/uploads/${file.filename}`)));
-    res.status(500).json({ message: "Server error" });
+    console.error("Could not update car or upload its images:", err.message);
+    await removeCloudinaryImages(uploadedAssets.map((asset) => asset.publicId));
+    res.status(500).json({ message: err.message || "Could not update car." });
   }
 });
 
